@@ -1,0 +1,153 @@
+version: '3.4'
+# this video helps with cloudflare setup https://www.youtube.com/watch?v=Ivxk6SuItbU&ab_channel=TechwithMarco 
+secrets:
+  cloudflare-token:
+    file: "./secrets/cloudflare-token.secret" 
+  cloudflare-email:
+    file: "./secrets/cloudflare-email.secret"    
+   
+services:
+  traefik:
+    image: "traefik:v2.11"
+    restart: always
+    container_name: "traefik"
+    networks:
+      - mynetwork
+    command:
+      - "--log.level=DEBUG"
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --api.dashboard=true
+      # Set up LetsEncrypt certificate resolver
+      - --certificatesresolvers.letsencrypt.acme.dnschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.dnschallenge.provider=cloudflare
+      - --certificatesResolvers.letsencrypt.acme.dnschallenge.resolvers=1.1.1.1:53,1.0.0.1:53
+      - --certificatesResolvers.letsencrypt.acme.dnschallenge.delayBeforeCheck=20
+      - --certificatesresolvers.letsencrypt.acme.email=youremail@gmail.com # CHANGE HERE
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      # staging environment of LE, remove for real certs
+      #- --certificatesresolvers.letsencrypt.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory  - this is the staging url 
+      - --certificatesresolvers.letsencrypt.acme.caserver=https://acme-v02.api.letsencrypt.org/directory
+      # Set up an insecure listener that redirects all traffic to TLS
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      # - --entrypoints.websecure.http.middlewares=traefik-forward-auth
+      # Set up the TLS configuration for our websecure listener
+      - --entrypoints.websecure.http.tls=true
+      - --entrypoints.websecure.http.tls.certResolver=letsencrypt
+      - --entrypoints.websecure.http.tls.domains[0].main=yourdomain.org  # CHANGE HERE
+      - --entrypoints.websecure.http.tls.domains[0].sans=*.yourdomain.org # CHANGE HERE
+    secrets:
+      - "cloudflare-token"
+      - "cloudflare-email"
+    environment:
+      - "CF_DNS_API_TOKEN_FILE=/run/secrets/cloudflare-token"
+      - "CF_API_EMAIL_FILE=/run/secrets/cloudflare-email"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "./certs:/letsencrypt" # create folder certs
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.dev.yourdomain.org`)"  # CHANGE HERE
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.routers.traefik.tls.certresolver=letsencrypt"      
+      - "traefik.http.routers.traefik.middlewares=traefik-auth"
+      - "traefik.http.middlewares.traefik-auth.basicauth.users=user:{SHA}EtfyZU+wgWTV563pLJlJWWgyzDSck=" # user is the login name after ":"here i just use an sha coded password so that traefik dashboard is secured as well, you can just delete this if you want or encrypt one password online
+
+  paste-bin:
+    container_name: paste-bin
+    image: ghcr.io/enchant97/hasty-paste:latest
+    restart: unless-stopped
+    depends_on:
+      - traefik-forward-auth
+    networks:
+      - mynetwork
+    labels:
+      - "traefik.enable=true"
+      - 'traefik.http.routers.paste.rule=Host(`paste.dev.yourdomain.org`)' # CHANGE HERE
+      - "traefik.http.routers.paste.entrypoints=websecure"
+      - "traefik.http.routers.paste.tls.certresolver=letsencrypt"   
+      - "traefik.http.routers.paste.middlewares=forwardauth"  # Add this line to any image to make it use forwardauth
+
+  traefik-forward-auth:
+    image: mesosphere/traefik-forward-auth
+    container_name: traefik-forward-auth
+    restart: on-failure
+    depends_on:
+      - traefik
+      - keycloak
+    environment:
+      - TZ=Europe/Berlin
+      - SECRET=fd92459cd7ygafc2df466sdg3747z43ce0d # CHANGE HERE, random secret
+      - PROVIDER_URI=https://keycloak.dev.yourdomain.org/realms/myrealm  # CHANGE HERE , myrealm is a realm i created in keyclak
+      - CLIENT_ID=my-client # CHANGE HERE
+      - CLIENT_SECRET=wueZ37IOE42Sv3XVqJyhrLX3WIk4y # CHANGE HERE
+      - COOKIE_DOMAIN=https://dev.yourdomain.org
+      - DISABLE_SSL_VERIFICATION=true # might be unnecessary
+      - INSECURE_COOKIE=1
+      - ENCRYPTION_KEY=7347373954253633845947936  # CHANGE HERE, random key
+      - SCOPE=profile email openid # this is a must!!
+    networks:
+        - mynetwork
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.services.traefik-forward-auth.loadbalancer.server.port=4181"
+      - "traefik.http.routers.traefik-forward-auth.entrypoints=websecure"
+      - "traefik.http.routers.traefik-forward-auth.middlewares=forwardauth"
+      - "traefik.http.middlewares.forwardauth.forwardauth.address=http://traefik-forward-auth:4181"
+      - "traefik.http.middlewares.forwardauth.forwardauth.authResponseHeaders=X-Forwarded-User"
+      - "traefik.http.middlewares.forwardauth.forwardauth.trustForwardHeader=true"
+
+
+  keycloakdb:
+    image: postgres:16.2-alpine
+    container_name: keycloakdb
+    environment:
+        - POSTGRES_DB=keycloak
+        - POSTGRES_USER=keycloak
+        - POSTGRES_PASSWORD=password
+        - POSTGRES_ROOT_PASSWORD=password
+    networks:
+      - mynetwork
+    ports:
+      - "5432:5432"
+    volumes:
+      - keycloakdata:/var/lib/postgresql/data
+    labels:
+      - "traefik.enable=false"
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    container_name: keycloak
+    hostname: keycloak
+    environment:
+      - KC_HOSTNAME_STRICT=false
+      - KC_DB=postgres
+      - KC_DB_URL=jdbc:postgresql://keycloakdb/keycloak
+      - KC_DB_URL_PORT=5432
+      - KC_DB_USERNAME=keycloak
+      - KC_DB_PASSWORD=password
+      - KC_DB_SCHEMA=public
+      - KC_LOG_LEVEL=info
+      - KC_FEATURES=docker
+      - KEYCLOAK_ADMIN=admin
+      - KEYCLOAK_ADMIN_PASSWORD=password
+      - KC_PROXY=edge
+    networks:
+      - mynetwork
+    depends_on:
+      - traefik
+      - keycloakdb
+    labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.keycloak.rule=Host(`keycloak.dev.yourdomain.org`)" # CHANGE HERE
+        - "traefik.http.routers.keycloak.entrypoints=websecure"
+        - "traefik.http.routers.keycloak.tls.certresolver=letsencrypt"
+    entrypoint: ["/opt/keycloak/bin/kc.sh", "start-dev"]
